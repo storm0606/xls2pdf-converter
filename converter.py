@@ -1,14 +1,22 @@
 """
-XLS → PDF 核心转换模块 v5 — 像素级还原 Excel 原样式
+XLS → PDF 核心转换模块 v5.2 — 像素级还原 Excel 原样式
+
+v5.2 修复：
+  - 多页重复页眉（标题+副标题+日期+表头+分隔线）
+  - 页眉黑色分隔线正确渲染
+  - 固定左边距 67.6pt (2.38cm) 匹配基准报告
+  - 默认行高 330 (16.5pt) 匹配 XLS 数据行
+  - ArialMT 字体注册（日期行符号）
+  - 每页右上角自动添加页码
+
+v5.1 修复：
+  - 恢复排除 #000000 背景（xlrd无填充标记 pattern_colour_index=64 映射为 #000000）
 
 v5 修复：
   - 对齐映射修正（0=general/1=left/2=center/3=right）
   - CJK 字体回退（英文字体用于中文时自动切换）
   - 表格整体居中
   - 字体注册名使用稳定哈希
-
-v5.1 修复：
-  - 恢复排除 #000000 背景（xlrd无填充标记 pattern_colour_index=64 映射为 #000000）
 """
 import os
 import glob
@@ -27,6 +35,9 @@ from font_subsetter import find_font, subset_font
 _BOLD_FONT_MAP = {
     'arial': 'arialbd.ttf',
     'liberation sans': 'LiberationSans-Bold.ttf',
+    '微软雅黑': 'msyhbd-fixed.ttf',
+    'microsoftyahei': 'msyhbd-fixed.ttf',
+    'microsoft yahei': 'msyhbd-fixed.ttf',
 }
 
 # xlrd BIFF8 默认 64 色调色板（仅作为 fallback）
@@ -85,10 +96,15 @@ COL_UNIT_PT = 7.0 / 256.0 * 72.0 / 96.0
 BORDER_THIN = 0.5   # 细线
 BORDER_MEDIUM = 1.0  # 中等线
 BORDER_BLACK = 1.0   # 黑色边框专用线宽（加粗黑色分隔线）
-MARGIN = 14
+MARGIN = 14           # 上下边距 (pt)
+TOP_MARGIN = 44.0     # 上边距，使标题基线位置匹配基准
+BOTTOM_MARGIN = 51.7  # 下边距 1.82cm，匹配基准报告
+LEFT_MARGIN = 54.0    # 固定左边距，使 XLS 列布局与基准对齐
+RIGHT_MARGIN = 67.9   # 固定右边距 2.39cm，匹配基准报告
+DEFAULT_ROW_H = 330   # 默认行高 16.5pt（匹配 XLS 数据行）
 A4_W = 595.28
 A4_H = 841.89
-USABLE_H = A4_H - MARGIN * 2
+USABLE_H = A4_H - TOP_MARGIN - BOTTOM_MARGIN
 
 
 def parse_xls(xls_path):
@@ -228,7 +244,16 @@ def _register_subsets(sheets):
     bold_fallback_reg = None
 
     for fname in font_names:
-        fpath = find_font(fname)
+        # ── Arial/ArialMT 特殊处理：优先使用本地 fonts/ArialMT.ttf ──
+        fpath = None
+        if fname.lower() in ('arial', 'arialmt'):
+            local_arial = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), 'fonts', 'ArialMT.ttf'
+            )
+            if os.path.exists(local_arial):
+                fpath = local_arial
+        if not fpath:
+            fpath = find_font(fname)
         if not fpath:
             print(f'[WARN] Font not found: {fname}')
             continue
@@ -371,13 +396,19 @@ def _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h, font_map, bold_font
     if needs_cjk_fallback:
         base_reg = fallback_reg or font_map.get(font_name, 'Helvetica')
         bold_reg = bold_fallback_reg if is_bold else None
+        # 混合字体模式：保留原始英文字体用于非CJK片段
+        orig_reg = font_map.get(font_name, 'Helvetica')
     elif is_cjk:
-        # CJK 字体：常规字体直接使用，粗体使用 fallback 粗体（同字体，stroke模拟）
+        # CJK 字体：常规字体直接使用，粗体优先使用 bold_font_map 中的真粗体
         base_reg = font_map.get(font_name, 'Helvetica')
-        bold_reg = bold_fallback_reg if is_bold and bold_fallback_reg else None
+        bold_reg = bold_font_map.get(font_name) if is_bold and bold_font_map else None
+        if not bold_reg:
+            bold_reg = bold_fallback_reg if is_bold and bold_fallback_reg else None
+        orig_reg = None
     else:
         base_reg = font_map.get(font_name, 'Helvetica')
         bold_reg = bold_font_map.get(font_name) if is_bold and bold_font_map else None
+        orig_reg = None
 
     # 选择最终字体注册名
     if is_bold and bold_reg:
@@ -414,6 +445,78 @@ def _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h, font_map, bold_font
     vert = style['vert_align']
     pad = 2
 
+    # ── 混合字体渲染：CJK 回退时，逐段切换字体 ──
+    if needs_cjk_fallback and orig_reg:
+        # 将文本按 CJK/非CJK 分段，分别用不同字体渲染
+        segments = []  # [(text, is_cjk_char), ...]
+        current = ''
+        current_is_cjk = None
+        for ch in text:
+            ch_is_cjk = _has_cjk(ch)
+            if current_is_cjk is None or ch_is_cjk == current_is_cjk:
+                current += ch
+                current_is_cjk = ch_is_cjk
+            else:
+                segments.append((current, current_is_cjk))
+                current = ch
+                current_is_cjk = ch_is_cjk
+        if current:
+            segments.append((current, current_is_cjk))
+
+        # 计算总宽度用于对齐
+        total_w = 0
+        for seg_text, seg_is_cjk in segments:
+            seg_font = reg_name if seg_is_cjk else orig_reg
+            try:
+                total_w += c.stringWidth(seg_text, seg_font, font_size)
+            except Exception:
+                total_w += c.stringWidth(seg_text, 'Helvetica', font_size)
+
+        # 计算起始 X
+        if horz == 0:
+            ctype = style.get('ctype', -1)
+            if ctype == 2:
+                tx = x2 - total_w - pad
+            else:
+                tx = x1 + pad
+        elif horz == 1:
+            tx = x1 + pad
+        elif horz == 2:
+            tx = x1 + (w - total_w) / 2.0
+        elif horz == 3:
+            tx = x2 - total_w - pad
+        else:
+            tx = x1 + pad
+
+        if vert == 2:
+            ty = y2 + pad
+        elif vert == 1:
+            if font_size > h:
+                ty = y1 - 1.0
+            else:
+                ty = y2 + (h - font_size) / 2.0
+        else:
+            ty = y1 - font_size - pad
+
+        # 逐段渲染
+        cur_x = tx
+        for seg_text, seg_is_cjk in segments:
+            seg_font = reg_name if seg_is_cjk else orig_reg
+            try:
+                c.setFont(seg_font, font_size)
+            except Exception:
+                c.setFont('Helvetica', font_size)
+                seg_font = 'Helvetica'
+            if use_stroke_sim and seg_is_cjk:
+                c.saveState()
+                c.setLineWidth(0.3)
+                c.drawString(cur_x + 0.3, ty, seg_text)
+                c.restoreState()
+            c.drawString(cur_x, ty, seg_text)
+            cur_x += c.stringWidth(seg_text, seg_font, font_size)
+        return
+
+    # ── 常规渲染（非混合字体） ──
     # 水平对齐：0=general, 1=left, 2=center, 3=right
     if horz == 0:
         ctype = style.get('ctype', -1)
@@ -436,7 +539,10 @@ def _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h, font_map, bold_font
     if vert == 2:
         ty = y2 + pad
     elif vert == 1:
-        ty = y2 + (h - font_size) / 2.0
+        if font_size > h:
+            ty = y1 - 1.0
+        else:
+            ty = y2 + (h - font_size) / 2.0
     else:
         ty = y1 - font_size - pad
 
@@ -448,6 +554,82 @@ def _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h, font_map, bold_font
         c.drawString(tx + 0.3, ty, text)
         c.restoreState()
     c.drawString(tx, ty, text)
+
+
+def _detect_header_end_row(sheet, row_h):
+    """自动检测页眉结束行：找到第一个数据行（表头行之后的行）
+    策略：找到有灰色/彩色边框的表头行，返回其行号+1（数据行起始）
+    如果无法自动检测，返回 0（无页眉）"""
+    nrows = sheet['nrows']
+    # 策略1: 寻找包含典型表头文字的行（序号/编号等）
+    header_keywords = ['序号', '编号', 'No', 'ID', '号']
+    for ri in range(min(20, nrows)):
+        for ci in range(min(sheet['ncols'], 10)):
+            style = sheet['cell_styles'].get((ri, ci))
+            if style and style['text']:
+                txt = style['text'].strip()
+                if any(kw in txt for kw in header_keywords):
+                    # 找到表头行，数据行从 ri+1 开始
+                    return ri + 1
+    # 策略2: 如果没找到表头关键词，检查前几行是否有大字体标题
+    # 找到第一个 >12pt 的行，然后找到第一个 <=12pt 的数据行
+    found_title = False
+    for ri in range(min(20, nrows)):
+        for ci in range(min(sheet['ncols'], 10)):
+            style = sheet['cell_styles'].get((ri, ci))
+            if style and style['font_height_pt'] > 12:
+                found_title = True
+                break
+        if found_title:
+            # 找到标题后，继续查找数据行起始
+            for dr in range(ri + 1, min(20, nrows)):
+                h = row_h[dr]
+                if h > 10:  # 有实际高度的行
+                    return dr
+            break
+    return 0
+
+
+def _draw_header_rows(c, header_end, sheet, col_x, col_w, row_h, font_map, bold_font_map, fallback_reg, bold_fallback_reg, page_w, page_num):
+    """绘制页眉行（Row0 到 header_end-1），返回页眉占用的总高度"""
+    header_height = sum(row_h[ri] for ri in range(header_end))
+    y = A4_H - TOP_MARGIN
+    row_y = {}
+    for ri in range(header_end):
+        row_y[ri] = y
+        y -= row_h[ri]
+
+    # 绘制页眉单元格
+    for ri in range(header_end):
+        for ci in range(sheet['ncols']):
+            if (ri, ci) in sheet['merged_slave']:
+                continue
+            if (ri, ci) in sheet['merged_map']:
+                rhi, chi = sheet['merged_map'][(ri, ci)]
+                if rhi <= 0 or ri >= header_end:
+                    continue
+            _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h,
+                        font_map, bold_font_map=bold_font_map,
+                        fallback_reg=fallback_reg, bold_fallback_reg=bold_fallback_reg)
+
+    # ── 绘制页码（右上角） ──
+    if page_num is not None:
+        # 使用微软雅黑字体绘制页码
+        msyh_reg = font_map.get('微软雅黑', fallback_reg or 'Helvetica')
+        page_font_size = 10
+        try:
+            c.setFont(msyh_reg, page_font_size)
+        except Exception:
+            c.setFont('Helvetica', page_font_size)
+        page_text = str(page_num)
+        tw = c.stringWidth(page_text, msyh_reg, page_font_size)
+        # 页码位置：右对齐，X终点=18.40cm=521.6pt
+        px = 521.6 - tw
+        # Y位置：26.96cm → PDF坐标 = 841.85 - 26.96*72/2.54 ≈ 77.7pt
+        py = 77.7
+        c.drawString(px, py, page_text)
+
+    return header_height
 
 
 def xls_to_pdf(xls_path, output_path=None):
@@ -477,42 +659,80 @@ def xls_to_pdf(xls_path, output_path=None):
             continue
 
         col_w = [w * COL_UNIT_PT for w in sheet['col_widths']]
-        row_h = [sheet['row_heights'].get(ri, 300) / 20.0 for ri in range(nrows)]
+        row_h = []
+        for ri in range(nrows):
+            h = sheet['row_heights'].get(ri)
+            if h is not None and h > 0:
+                row_h.append(h / 20.0)
+            else:
+                # 行高缺失：检查是否有内容
+                has_content = False
+                for ci in range(ncols):
+                    style = sheet['cell_styles'].get((ri, ci))
+                    if style and style['text']:
+                        has_content = True
+                        break
+                if has_content:
+                    row_h.append(DEFAULT_ROW_H / 20.0)
+                else:
+                    # 空行使用 xlrd 默认行高 255 (12.75pt)
+                    row_h.append(12.75)
 
-        # ── 计算表格整体居中偏移 ──
+        # ── 固定左边距（匹配基准报告 2.38cm） ──
         total_table_w = sum(col_w)
-        page_w = max_page_w  # 使用与Canvas一致的实际页面宽度
-        if total_table_w < page_w - 2 * MARGIN:
-            offset_x = (page_w - total_table_w) / 2.0
+        page_w = max_page_w
+        if total_table_w <= page_w - LEFT_MARGIN - RIGHT_MARGIN:
+            offset_x = LEFT_MARGIN
         else:
-            offset_x = MARGIN
+            offset_x = MARGIN  # 超宽表格回退到小边距
 
-        # 分页
+        col_x = {}
+        x = offset_x
+        for ci in range(ncols):
+            col_x[ci] = x
+            x += col_w[ci]
+
+        # ── 自动检测页眉结束行 ──
+        header_end = _detect_header_end_row(sheet, row_h)
+        header_height = sum(row_h[ri] for ri in range(header_end)) if header_end > 0 else 0
+
+        # 数据行可用高度 = 总可用高度 - 页眉高度
+        data_usable_h = USABLE_H - header_height
+
+        # ── 对数据行分页 ──
+        data_start = header_end  # 数据行起始行号
         pages = []
-        cur_row = 0
+        cur_row = data_start
         while cur_row < nrows:
             used_h = 0
             page_start = cur_row
             while cur_row < nrows:
-                if used_h + row_h[cur_row] > USABLE_H and cur_row > page_start:
+                if used_h + row_h[cur_row] > data_usable_h and cur_row > page_start:
                     break
                 used_h += row_h[cur_row]
                 cur_row += 1
             pages.append((page_start, cur_row))
 
-        for page_start, page_end in pages:
+        # ── 逐页绘制 ──
+        for page_idx, (page_start, page_end) in enumerate(pages):
+            page_num = page_idx + 1
+
+            # 绘制页眉（每页重复）
+            if header_end > 0:
+                actual_header_h = _draw_header_rows(
+                    c, header_end, sheet, col_x, col_w, row_h,
+                    font_map, bold_font_map, fallback_reg, bold_fallback_reg,
+                    page_w, page_num
+                )
+
+            # 计算数据行的 Y 坐标
             row_y = {}
-            y = A4_H - MARGIN
+            y = A4_H - TOP_MARGIN - header_height
             for ri in range(page_start, page_end):
                 row_y[ri] = y
                 y -= row_h[ri]
 
-            col_x = {}
-            x = offset_x
-            for ci in range(ncols):
-                col_x[ci] = x
-                x += col_w[ci]
-
+            # 绘制数据行
             for ri in range(page_start, page_end):
                 for ci in range(ncols):
                     if (ri, ci) in sheet['merged_slave']:
