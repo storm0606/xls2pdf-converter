@@ -83,8 +83,8 @@ def _xlrd_date_to_str(val, wb):
     try:
         dt = xlrd.xldate_as_tuple(val, wb.datemode)
         if dt[3] == 0 and dt[4] == 0 and dt[5] == 0:
-            return f'{dt[0]}/{dt[1]:02d}/{dt[2]:02d}'
-        return f'{dt[0]}/{dt[1]:02d}/{dt[2]:02d} {dt[3]:02d}:{dt[4]:02d}:{dt[5]:02d}'
+            return f'{dt[0]}-{dt[1]:02d}-{dt[2]:02d}'
+        return f'{dt[0]}-{dt[1]:02d}-{dt[2]:02d} {dt[3]:02d}:{dt[4]:02d}:{dt[5]:02d}'
     except Exception:
         return str(val)
 
@@ -532,9 +532,9 @@ def _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h, font_map, bold_font
     # 水平对齐：0=general, 1=left, 2=center, 3=right
     if horz == 0:
         ctype = style.get('ctype', -1)
-        if ctype == 2:
+        if ctype == 2 or ctype == 3:  # 数字和日期默认右对齐
             tw = c.stringWidth(text, reg_name, font_size)
-            tx = x2 - tw - pad
+            tx = x2 - tw  # 日期/数字右对齐，无额外pad
         else:
             tx = x1 + pad
     elif horz == 1:
@@ -602,7 +602,7 @@ def _detect_header_end_row(sheet, row_h):
     return 0
 
 
-def _draw_header_rows(c, header_end, sheet, col_x, col_w, row_h, font_map, bold_font_map, fallback_reg, bold_fallback_reg, page_w, page_num):
+def _draw_header_rows(c, header_end, sheet, col_x, col_w, row_h, font_map, bold_font_map, fallback_reg, bold_fallback_reg, page_w, page_num, visible_right_edge=None):
     """绘制页眉行（Row0 到 header_end-1），返回页眉占用的总高度"""
     header_height = sum(row_h[ri] for ri in range(header_end))
     y = A4_H - TOP_MARGIN
@@ -612,6 +612,12 @@ def _draw_header_rows(c, header_end, sheet, col_x, col_w, row_h, font_map, bold_
         y -= row_h[ri]
 
     # 绘制页眉单元格
+    # 表格右边缘 = 可见内容最右侧（排除空列），确保日期右对齐到最右竖线
+    if visible_right_edge is not None:
+        table_right_edge = visible_right_edge
+    else:
+        last_ci = max(col_x.keys()) if col_x else 0
+        table_right_edge = (col_x[last_ci] + col_w[last_ci]) if col_x and col_w else LEFT_MARGIN
     for ri in range(header_end):
         for ci in range(sheet['ncols']):
             if (ri, ci) in sheet['merged_slave']:
@@ -620,6 +626,23 @@ def _draw_header_rows(c, header_end, sheet, col_x, col_w, row_h, font_map, bold_
                 rhi, chi = sheet['merged_map'][(ri, ci)]
                 if rhi <= 0 or ri >= header_end:
                     continue
+            # 页眉中日期类型单元格：右对齐到表格右侧竖线
+            style = sheet['cell_styles'].get((ri, ci))
+            if style and style.get('ctype') == 3:
+                # 临时修改col_w，让合并区域x2扩展到表格右边缘
+                orig_merged = None
+                if (ri, ci) in sheet['merged_map']:
+                    orig_merged = sheet['merged_map'][(ri, ci)]
+                    # 计算当前合并区域x2
+                    cur_x2 = col_x[orig_merged[1] - 1] + col_w[orig_merged[1] - 1] if orig_merged[1] - 1 < len(col_w) else col_x[ci] + col_w[ci]
+                    if cur_x2 < table_right_edge:
+                        extra = table_right_edge - cur_x2
+                        col_w[orig_merged[1] - 1] += extra
+                        _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h,
+                                   font_map, bold_font_map=bold_font_map,
+                                   fallback_reg=fallback_reg, bold_fallback_reg=bold_fallback_reg)
+                        col_w[orig_merged[1] - 1] -= extra
+                        continue
             _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h,
                         font_map, bold_font_map=bold_font_map,
                         fallback_reg=fallback_reg, bold_fallback_reg=bold_fallback_reg)
@@ -687,11 +710,53 @@ def xls_to_pdf(xls_path, output_path=None):
                     # 空行使用 xlrd 默认行高 255 (12.75pt)
                     row_h.append(12.75)
 
-        # ── 固定左边距（匹配基准报告 2.38cm） ──
+        # ── 自动检测页眉结束行 ──
+        header_end = _detect_header_end_row(sheet, row_h)
+
+        # ── 水平居中：基于数据行可见内容列计算偏移 ──
+        # 只考虑数据行（非页眉标题行），确保所有页面居中一致
+        first_visible_col = 0
+        for ci in range(ncols):
+            has_visible = False
+            for ri in range(header_end, nrows):
+                style = sheet['cell_styles'].get((ri, ci))
+                if style and (style['text'] or style['border_left'] > 0
+                              or style['border_right'] > 0
+                              or style['border_top'] > 0
+                              or style['border_bottom'] > 0):
+                    has_visible = True
+                    break
+            if has_visible:
+                first_visible_col = ci
+                break
+
+        last_visible_col = ncols - 1
+        for ci in range(ncols - 1, -1, -1):
+            has_visible = False
+            for ri in range(header_end, nrows):
+                style = sheet['cell_styles'].get((ri, ci))
+                if style and (style['text'] or style['border_left'] > 0
+                              or style['border_right'] > 0
+                              or style['border_top'] > 0
+                              or style['border_bottom'] > 0):
+                    has_visible = True
+                    break
+            if has_visible:
+                last_visible_col = ci
+                break
+
         total_table_w = sum(col_w)
+        # 可见内容的实际宽度
+        visible_w = sum(col_w[first_visible_col:last_visible_col + 1])
+        # 前置空列宽度
+        prefix_w = sum(col_w[:first_visible_col])
+        # 后置空列宽度
+        suffix_w = sum(col_w[last_visible_col + 1:]) if last_visible_col < ncols - 1 else 0
         page_w = max_page_w
-        if total_table_w <= page_w - LEFT_MARGIN - RIGHT_MARGIN:
-            offset_x = LEFT_MARGIN
+        if visible_w <= page_w - MARGIN * 2:
+            # 让可见内容区域居中
+            visible_offset = (page_w - visible_w) / 2.0
+            offset_x = visible_offset - prefix_w
         else:
             offset_x = MARGIN  # 超宽表格回退到小边距
 
@@ -700,9 +765,6 @@ def xls_to_pdf(xls_path, output_path=None):
         for ci in range(ncols):
             col_x[ci] = x
             x += col_w[ci]
-
-        # ── 自动检测页眉结束行 ──
-        header_end = _detect_header_end_row(sheet, row_h)
 
         # ── 数据行行高缩放：匹配基准PDF行间距14pt ──
         # XLS模板数据行高度330(16.5pt)，基准PDF实际渲染为14pt
@@ -743,7 +805,8 @@ def xls_to_pdf(xls_path, output_path=None):
                 actual_header_h = _draw_header_rows(
                     c, header_end, sheet, col_x, col_w, row_h,
                     font_map, bold_font_map, fallback_reg, bold_fallback_reg,
-                    page_w, None  # 不绘制页码，基准PDF无页码
+                    page_w, None,  # 不绘制页码，基准PDF无页码
+                    visible_right_edge=col_x[last_visible_col] + col_w[last_visible_col]
                 )
 
             # 计算数据行的 Y 坐标
@@ -752,6 +815,7 @@ def xls_to_pdf(xls_path, output_path=None):
                 y = A4_H - TOP_MARGIN - header_height
             else:
                 y = A4_H - TOP_MARGIN  # 非首页无页眉，数据行从顶部开始
+
             for ri in range(page_start, page_end):
                 row_y[ri] = y
                 y -= row_h[ri]
