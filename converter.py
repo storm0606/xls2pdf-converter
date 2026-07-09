@@ -96,12 +96,13 @@ COL_UNIT_PT = 7.0 / 256.0 * 72.0 / 96.0
 BORDER_THIN = 0.5   # 细线
 BORDER_MEDIUM = 1.0  # 中等线
 BORDER_BLACK = 1.0   # 黑色边框专用线宽（加粗黑色分隔线）
+BLACK_LINE_H = 0.96   # 黑色填充矩形高度(pt)，匹配基准PDF分隔线视觉效果
 MARGIN = 14           # 上下边距 (pt)
 TOP_MARGIN = 44.0     # 上边距，使标题基线位置匹配基准
 BOTTOM_MARGIN = 51.7  # 下边距 1.82cm，匹配基准报告
 LEFT_MARGIN = 54.0    # 固定左边距，使 XLS 列布局与基准对齐
 RIGHT_MARGIN = 67.9   # 固定右边距 2.39cm，匹配基准报告
-DEFAULT_ROW_H = 330   # 默认行高 16.5pt（匹配 XLS 数据行）
+DEFAULT_ROW_H = 280   # 默认行高 14pt（匹配基准PDF数据行间距）
 A4_W = 595.28
 A4_H = 841.89
 USABLE_H = A4_H - TOP_MARGIN - BOTTOM_MARGIN
@@ -163,6 +164,7 @@ def parse_xls(xls_path):
                     'font_height_pt': font.height / 20.0,
                     'font_bold': font.weight >= 700,
                     'font_colour_hex': _colour_index_to_hex(wb, font.colour_index),
+
                     'horz_align': xf.alignment.hor_align,
                     'vert_align': xf.alignment.vert_align,
                     'border_left': xf.border.left_line_style,
@@ -369,17 +371,27 @@ def _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h, font_map, bold_font
                 c.setStrokeColor(black)
             is_black_border = (bc == '#000000')
             if is_black_border:
-                c.setLineWidth(BORDER_BLACK)
+                # ── 黑色边框用填充矩形绘制，匹配基准PDF：锐利边缘、100%纯黑 ──
+                c.setFillColor(black)
+                half = BLACK_LINE_H / 2.0
+                if side == 'left':
+                    c.rect(x1 - half, y2, BLACK_LINE_H, y1 - y2, fill=1, stroke=0)
+                elif side == 'right':
+                    c.rect(x2 - half, y2, BLACK_LINE_H, y1 - y2, fill=1, stroke=0)
+                elif side == 'top':
+                    c.rect(x1, y1 - half, x2 - x1, BLACK_LINE_H, fill=1, stroke=0)
+                elif side == 'bottom':
+                    c.rect(x1, y2 - half, x2 - x1, BLACK_LINE_H, fill=1, stroke=0)
             else:
                 c.setLineWidth(BORDER_THIN if bw == 1 else BORDER_MEDIUM)
-            if side == 'left':
-                c.line(x1, y2, x1, y1)
-            elif side == 'right':
-                c.line(x2, y2, x2, y1)
-            elif side == 'top':
-                c.line(x1, y1, x2, y1)
-            elif side == 'bottom':
-                c.line(x1, y2, x2, y2)
+                if side == 'left':
+                    c.line(x1, y2, x1, y1)
+                elif side == 'right':
+                    c.line(x2, y2, x2, y1)
+                elif side == 'top':
+                    c.line(x1, y1, x2, y1)
+                elif side == 'bottom':
+                    c.line(x1, y2, x2, y2)
 
     # ── 文本 ──
     text = style['text']
@@ -612,22 +624,19 @@ def _draw_header_rows(c, header_end, sheet, col_x, col_w, row_h, font_map, bold_
                         font_map, bold_font_map=bold_font_map,
                         fallback_reg=fallback_reg, bold_fallback_reg=bold_fallback_reg)
 
-    # ── 绘制页码（右上角） ──
-    if page_num is not None:
-        # 使用微软雅黑字体绘制页码
-        msyh_reg = font_map.get('微软雅黑', fallback_reg or 'Helvetica')
-        page_font_size = 10
-        try:
-            c.setFont(msyh_reg, page_font_size)
-        except Exception:
-            c.setFont('Helvetica', page_font_size)
-        page_text = str(page_num)
-        tw = c.stringWidth(page_text, msyh_reg, page_font_size)
-        # 页码位置：右对齐，X终点=18.40cm=521.6pt
-        px = 521.6 - tw
-        # Y位置：26.96cm → PDF坐标 = 841.85 - 26.96*72/2.54 ≈ 77.7pt
-        py = 77.7
-        c.drawString(px, py, page_text)
+    # ── 绘制页码（已禁用：基准PDF无页码） ──
+    # if page_num is not None:
+    #     msyh_reg = font_map.get('微软雅黑', fallback_reg or 'Helvetica')
+    #     page_font_size = 10
+    #     try:
+    #         c.setFont(msyh_reg, page_font_size)
+    #     except Exception:
+    #         c.setFont('Helvetica', page_font_size)
+    #     page_text = str(page_num)
+    #     tw = c.stringWidth(page_text, msyh_reg, page_font_size)
+    #     px = 521.6 - tw
+    #     py = 77.7
+    #     c.drawString(px, py, page_text)
 
     return header_height
 
@@ -694,40 +703,55 @@ def xls_to_pdf(xls_path, output_path=None):
 
         # ── 自动检测页眉结束行 ──
         header_end = _detect_header_end_row(sheet, row_h)
+
+        # ── 数据行行高缩放：匹配基准PDF行间距14pt ──
+        # XLS模板数据行高度330(16.5pt)，基准PDF实际渲染为14pt
+        DATA_ROW_H_PT = 14.0   # 基准PDF数据行间距
+        for ri in range(header_end, len(row_h)):
+            if row_h[ri] > 12.0:  # 跳过空行/极小行
+                row_h[ri] = DATA_ROW_H_PT
+
         header_height = sum(row_h[ri] for ri in range(header_end)) if header_end > 0 else 0
 
-        # 数据行可用高度 = 总可用高度 - 页眉高度
-        data_usable_h = USABLE_H - header_height
+        # 数据行可用高度：首页需扣除页眉，非首页全幅可用
+        first_page_h = USABLE_H - header_height
+        later_page_h = USABLE_H  # 非首页无页眉，全幅可用
 
         # ── 对数据行分页 ──
         data_start = header_end  # 数据行起始行号
         pages = []
         cur_row = data_start
+        page_idx = 0
         while cur_row < nrows:
+            available = first_page_h if page_idx == 0 else later_page_h
             used_h = 0
             page_start = cur_row
             while cur_row < nrows:
-                if used_h + row_h[cur_row] > data_usable_h and cur_row > page_start:
+                if used_h + row_h[cur_row] > available and cur_row > page_start:
                     break
                 used_h += row_h[cur_row]
                 cur_row += 1
             pages.append((page_start, cur_row))
+            page_idx += 1
 
         # ── 逐页绘制 ──
         for page_idx, (page_start, page_end) in enumerate(pages):
             page_num = page_idx + 1
 
-            # 绘制页眉（每页重复）
-            if header_end > 0:
+            # 绘制页眉（仅首页）
+            if header_end > 0 and page_idx == 0:
                 actual_header_h = _draw_header_rows(
                     c, header_end, sheet, col_x, col_w, row_h,
                     font_map, bold_font_map, fallback_reg, bold_fallback_reg,
-                    page_w, page_num
+                    page_w, None  # 不绘制页码，基准PDF无页码
                 )
 
             # 计算数据行的 Y 坐标
             row_y = {}
-            y = A4_H - TOP_MARGIN - header_height
+            if page_idx == 0:
+                y = A4_H - TOP_MARGIN - header_height
+            else:
+                y = A4_H - TOP_MARGIN  # 非首页无页眉，数据行从顶部开始
             for ri in range(page_start, page_end):
                 row_y[ri] = y
                 y -= row_h[ri]
