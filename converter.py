@@ -93,8 +93,9 @@ def _xlrd_date_to_str(val, wb):
 # 1 字符宽度 ≈ 7 像素 (96 DPI) = 7*72/96 = 5.25 pt
 # 1 单位 = 5.25 / 256 ≈ 0.0205 pt
 COL_UNIT_PT = 7.0 / 256.0 * 72.0 / 96.0
-BORDER_THIN = 0.5   # 细线
+BORDER_THIN = 1.0   # 灰色内框线
 BORDER_MEDIUM = 1.0  # 中等线
+BORDER_OUTER = 0.5  # 灰色外框线（保持原粗细）
 BORDER_BLACK = 1.0   # 黑色边框专用线宽（加粗黑色分隔线）
 BLACK_LINE_H = 0.96   # 黑色填充矩形高度(pt)，匹配基准PDF分隔线视觉效果
 MARGIN = 14           # 上下边距 (pt)
@@ -323,8 +324,11 @@ def _register_subsets(sheets):
     return registered, bold_registered, fallback_reg, bold_fallback_reg
 
 
-def _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h, font_map, bold_font_map=None, fallback_reg=None, bold_fallback_reg=None):
-    """绘制单个单元格（背景+边框+文本）"""
+def _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h, font_map, bold_font_map=None, fallback_reg=None, bold_fallback_reg=None, table_bounds=None):
+    """绘制单个单元格（背景+边框+文本）
+    
+    table_bounds: (first_row, last_row, first_col, last_col) 表格边界，用于区分内/外框线
+    """
     style = sheet['cell_styles'].get((ri, ci))
     if not style:
         return
@@ -383,7 +387,27 @@ def _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h, font_map, bold_font
                 elif side == 'bottom':
                     c.rect(x1, y2 - half, x2 - x1, BLACK_LINE_H, fill=1, stroke=0)
             else:
-                c.setLineWidth(BORDER_THIN if bw == 1 else BORDER_MEDIUM)
+                # ── 内/外框线区分：外框线保持原粗细，内框线加粗 ──
+                # 外框 = 可见区域最外围的四条线：
+                #   左外框：x == 可见区域最左竖线位置
+                #   右外框：x == 可见区域最右竖线位置
+                #   上外框：第一数据行的top
+                #   下外框：最后数据行的bottom
+                is_outer = False
+                if table_bounds:
+                    first_row, last_row, first_col, last_col = table_bounds
+                    # 左右外框：当前单元格在最左/最右可见列，且是left/right边
+                    if (side == 'left' and ci == first_col) or \
+                       (side == 'right' and ci == last_col):
+                        is_outer = True
+                    # 上下外框：当前行是首行/末行，且是top/bottom边
+                    if (side == 'top' and ri == first_row) or \
+                       (side == 'bottom' and ri == last_row):
+                        is_outer = True
+                if is_outer:
+                    c.setLineWidth(BORDER_OUTER)
+                else:
+                    c.setLineWidth(BORDER_THIN if bw == 1 else BORDER_MEDIUM)
                 if side == 'left':
                     c.line(x1, y2, x1, y1)
                 elif side == 'right':
@@ -602,7 +626,7 @@ def _detect_header_end_row(sheet, row_h):
     return 0
 
 
-def _draw_header_rows(c, header_end, sheet, col_x, col_w, row_h, font_map, bold_font_map, fallback_reg, bold_fallback_reg, page_w, page_num, visible_right_edge=None):
+def _draw_header_rows(c, header_end, sheet, col_x, col_w, row_h, font_map, bold_font_map, fallback_reg, bold_fallback_reg, page_w, page_num, visible_right_edge=None, first_visible_col=None, last_visible_col=None):
     """绘制页眉行（Row0 到 header_end-1），返回页眉占用的总高度"""
     header_height = sum(row_h[ri] for ri in range(header_end))
     y = A4_H - TOP_MARGIN
@@ -626,6 +650,12 @@ def _draw_header_rows(c, header_end, sheet, col_x, col_w, row_h, font_map, bold_
                 rhi, chi = sheet['merged_map'][(ri, ci)]
                 if rhi <= 0 or ri >= header_end:
                     continue
+            # 页眉中的表头行（最后一行）：传table_bounds，使top/left/right为外框
+            # 其他页眉行：不区分内外框
+            header_table_bounds = None
+            if ri == header_end - 1:
+                # 表头行：top=外框，bottom=内框（分隔线），left/right按可见列判断
+                header_table_bounds = (header_end - 1, header_end - 1, first_visible_col, last_visible_col)
             # 页眉中日期类型单元格：右对齐到表格右侧竖线
             style = sheet['cell_styles'].get((ri, ci))
             if style and style.get('ctype') == 3:
@@ -640,12 +670,14 @@ def _draw_header_rows(c, header_end, sheet, col_x, col_w, row_h, font_map, bold_
                         col_w[orig_merged[1] - 1] += extra
                         _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h,
                                    font_map, bold_font_map=bold_font_map,
-                                   fallback_reg=fallback_reg, bold_fallback_reg=bold_fallback_reg)
+                                   fallback_reg=fallback_reg, bold_fallback_reg=bold_fallback_reg,
+                                   table_bounds=header_table_bounds)
                         col_w[orig_merged[1] - 1] -= extra
                         continue
             _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h,
                         font_map, bold_font_map=bold_font_map,
-                        fallback_reg=fallback_reg, bold_fallback_reg=bold_fallback_reg)
+                        fallback_reg=fallback_reg, bold_fallback_reg=bold_fallback_reg,
+                        table_bounds=header_table_bounds)
 
     # ── 绘制页码（已禁用：基准PDF无页码） ──
     # if page_num is not None:
@@ -806,7 +838,9 @@ def xls_to_pdf(xls_path, output_path=None):
                     c, header_end, sheet, col_x, col_w, row_h,
                     font_map, bold_font_map, fallback_reg, bold_fallback_reg,
                     page_w, None,  # 不绘制页码，基准PDF无页码
-                    visible_right_edge=col_x[last_visible_col] + col_w[last_visible_col]
+                    visible_right_edge=col_x[last_visible_col] + col_w[last_visible_col],
+                    first_visible_col=first_visible_col,
+                    last_visible_col=last_visible_col
                 )
 
             # 计算数据行的 Y 坐标
@@ -821,6 +855,7 @@ def xls_to_pdf(xls_path, output_path=None):
                 y -= row_h[ri]
 
             # 绘制数据行
+            data_table_bounds = (page_start, page_end - 1, first_visible_col, last_visible_col)
             for ri in range(page_start, page_end):
                 for ci in range(ncols):
                     if (ri, ci) in sheet['merged_slave']:
@@ -831,7 +866,8 @@ def xls_to_pdf(xls_path, output_path=None):
                             continue
                     _draw_cell(c, ri, ci, sheet, col_x, row_y, col_w, row_h,
                                font_map, bold_font_map=bold_font_map,
-                               fallback_reg=fallback_reg, bold_fallback_reg=bold_fallback_reg)
+                               fallback_reg=fallback_reg, bold_fallback_reg=bold_fallback_reg,
+                               table_bounds=data_table_bounds)
 
             c.showPage()
 
